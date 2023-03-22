@@ -1,54 +1,132 @@
 use std::thread;
-use std::time::Duration;
+
 use alsa::{Direction, ValueOr};
 use alsa::pcm::{PCM, HwParams, Format, Access, State};
+use clap::Parser;
+use std::sync::atomic::{AtomicBool, Ordering};
+use simple_logger::SimpleLogger;
+use log::{info};
+use audrey::read::BufFileReader;
+
+use std::ffi::OsString;
+use std::fs::read_dir;
+use std::sync::Arc;
+
+
+#[derive(Parser)]
+struct Cli {
+    /// The path to the file to read
+    path: std::path::PathBuf,
+}
 
 fn main() {
-    thread::spawn(move || {
-        let pcm = PCM::new("hw:1", Direction::Playback, false).unwrap();
+    SimpleLogger::new().init().unwrap();
+    let args = Cli::parse();
+    let switch_main  = Arc::new(AtomicBool::new(false));
+    let dir = args.path.clone();
 
-// Set hardware parameters: 44100 Hz / Mono / 16 bit
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let switch2 = Arc::clone(&switch_main);
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut line_buf = String::new();
+        while let Ok(_) = stdin.read_line(&mut line_buf) {
+            let line = line_buf.trim_end().to_string();
+            line_buf.clear();
+            tx.send(line).unwrap();
+            switch2.store(false, Ordering::Release);
+        }
+    });
+
+    let switch1 = Arc::clone(&switch_main);
+    thread::spawn(move || {
+
+        info!("Playback Thread Initiated");
+        let pcm = PCM::new("hw:1,0", Direction::Playback, false).unwrap();
         let hwp = HwParams::any(&pcm).unwrap();
+
+        // Set hardware parameters: 44100 Hz / Mono / 16 bit
         hwp.set_channels(2).unwrap();
         hwp.set_rate(44100, ValueOr::Nearest).unwrap();
         hwp.set_format(Format::s16()).unwrap();
         hwp.set_access(Access::RWInterleaved).unwrap();
-        pcm.hw_params(&hwp).unwrap();
-        println!("Begin IO test");
 
-        if pcm.io_u8().is_err() {
-            println!("u8 failed");
-            if pcm.io_i8().is_err() {
-                println!("i8 failed");
+        let reader = read_dir(dir.clone()).unwrap();
+        'stim: for result in reader {
+            let file = result.unwrap();
+            let path = file.path();
+            let fname = OsString::from(path.clone().strip_prefix(&*dir).unwrap());
 
-                if pcm.io_u16().is_err() {
-                    println!("u16 failed");
+            if path.extension().unwrap() == "wav" {
+                let wav = audrey::open(path).unwrap();
+                let wav_channels = wav.description().channel_count();
 
-                    if pcm.io_i16().is_err() {
-                        println!("i16 failed");
+                let data = process_audio(wav, wav_channels);
 
-                        if pcm.io_u32().is_err() {
-                            println!("u32 failed");
+                pcm.hw_params(&hwp).unwrap();
+                let io = pcm.io_i16().unwrap();
+                io.writei(&data).expect("Couldn't do io.writei on data");
+                info!("Begin playing {:?}", fname);
 
-                            if pcm.io_f32().is_err() {
-                                println!("f32 failed");
-
-                                if pcm.io_f64().is_err() {
-                                    println!("f64 failed");
-
-                                } else {let io = pcm.io_f64().unwrap();};
-                            } else {let io = pcm.io_f32().unwrap();};
-                        } else {let io = pcm.io_u32().unwrap();};
-                    } else {let io = pcm.io_i16().unwrap();};
-                } else {let io = pcm.io_u16().unwrap();};
-            } else {let io = pcm.io_i8().unwrap();};
-        } else {let io = pcm.io_u8().unwrap();};
-// Make sure we don't start the stream too early
-        let hwp = pcm.hw_params_current().unwrap();
-        let swp = pcm.sw_params_current().unwrap();
-        swp.set_start_threshold(hwp.get_buffer_size().unwrap()).unwrap();
-        pcm.sw_params(&swp).unwrap();
+                switch1.store(true, Ordering::Release);
+                while pcm.state() == State::Running {
+                    let pb = switch1.load(Ordering::Acquire);
+                    match pb {
+                        true => { continue },
+                        false => {
+                            pcm.drop().unwrap();
+                            info!("Interrupted {:?}, moving on ", fname);
+                            switch1.store(true, Ordering::Release);
+                            continue 'stim
+                        }
+                    }
+                }
+                info!("Current state is {:?}", pcm.state());
+                pcm.drop().unwrap();
+                //pcm.reset().unwrap();
+                info!("Finished playing {:?}, continuing", fname);
+            }
+        }
     });
-    thread::sleep(Duration::from_secs(20))// Open default playback device
 
+    loop {
+        let text = rx.recv().unwrap();
+        info!("Received {:?}",text);
+    }
+}
+
+
+fn process_audio(mut wav: BufFileReader, wav_channels: u32) -> Vec<i16>{
+    let mut result = Vec::new();
+    let hw_channels = 2;
+
+    if wav_channels == 1 {
+        result = wav.frames::<[i16;1]>()
+            .map(Result::unwrap)
+            .map(|file| audrey::dasp_frame::Frame::scale_amp(file, 0.8))
+            .map(|note| note[0])
+            .collect::<Vec<i16>>();
+        if hw_channels == 2 {
+            result = result.iter()
+                .map(|note| [note, note])
+                .flatten()
+                .map(|f| *f )
+                .collect::<Vec<_>>()
+        }
+    } else if wav_channels == 2 {
+        result = wav.frames::<[i16;2]>()
+            .map(Result::unwrap)
+            .map(|file| audrey::dasp_frame::Frame::scale_amp(file, 0.8))
+            .flatten()
+            .collect::<Vec<i16>>();
+        if hw_channels == 1 {
+            result = result.iter()
+                .enumerate()
+                .filter(|f| f.0 % 2 == 0)
+                .map(|f| *f.1)
+                .collect::<Vec<_>>()
+        }
+    };
+    result
 }
